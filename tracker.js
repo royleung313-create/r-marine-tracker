@@ -3,27 +3,29 @@
 // 自動讀取 Google Sheets 船隻名單並寫回 24h 軌跡
 // ==========================================
 
-const API_KEY = process.env.AISSTREAM_API_KEY;
-const GAS_URL = process.env.GAS_URL;
-const LISTEN_TIMEOUT_MS = 210 * 1000; // 最多監聽 3.5 分鐘（覆蓋錨泊船每 3 分鐘發射一次的間隔）
+const API_KEY = (process.env.AISSTREAM_API_KEY || '').trim();
+const GAS_URL = (process.env.GAS_URL || '').trim();
+const LISTEN_TIMEOUT_MS = 210 * 1000; // 最多監聽 3.5 分鐘
 
 if (!API_KEY || !GAS_URL) {
   console.error('❌ 缺少 AISSTREAM_API_KEY 或 GAS_URL 環境變數');
   process.exit(1);
 }
 
+if (!GAS_URL.startsWith('https://')) {
+  console.error('❌ GAS_URL 格式唔正確（必須以 https:// 開頭），請檢查有冇同 AISSTREAM_API_KEY 掉轉貼錯！');
+  process.exit(1);
+}
+
 async function getTargetMmsis() {
-  try {
-    const res = await fetch(`${GAS_URL}?t=${Date.now()}`, { redirect: 'follow' });
-    const data = await res.json();
-    const list = (data.vessels || [])
-      .map(v => String(v.mmsi || '').replace(/\D/g, '').trim())
-      .filter(Boolean);
-    if (list.length > 0) {
-      return [...new Set(list)];
-    }
-  } catch (err) {
-    console.warn('⚠️ 讀取 Google Sheets 名單失敗，改用預設 MMSI：', err.message);
+  const res = await fetch(`${GAS_URL}?t=${Date.now()}`, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  const list = (data.vessels || [])
+    .map(v => String(v.mmsi || '').replace(/\D/g, '').trim())
+    .filter(Boolean);
+  if (list.length > 0) {
+    return [...new Set(list)];
   }
   return ['477995357'];
 }
@@ -47,10 +49,16 @@ async function decodeMessage(data) {
 }
 
 async function main() {
-  const targets = await getTargetMmsis();
-  console.log('🚢 本次追蹤 MMSI 名單：', targets.join(', '));
+  let targets = ['477995357'];
+  try {
+    targets = await getTargetMmsis();
+    console.log('✅ 成功從 Google Sheets 讀取最愛名單：', targets.join(', '));
+  } catch (err) {
+    console.warn('⚠️ 讀取 Google Sheets 名單失敗，改用預設 MMSI：', err.message);
+  }
 
   const recorded = new Set();
+  const seenOtherShips = new Set();
   const pendingPosts = [];
 
   await new Promise((resolve) => {
@@ -67,15 +75,15 @@ async function main() {
     };
 
     const timer = setTimeout(() => {
-      finish(`已達監聽上限（收到 ${recorded.size}/${targets.length} 隻船）`);
+      finish(`已達監聽上限（收到目標 ${recorded.size}/${targets.length} 隻船；期間香港周邊共收到 ${seenOtherShips.size} 隻其他船訊號）`);
     }, LISTEN_TIMEOUT_MS);
 
     ws.addEventListener('open', () => {
-      console.log('📡 已連線 AISstream，開始等待船隻訊號...');
+      console.log('📡 已連線 AISstream，開始監聽香港及周邊水域訊號...');
       ws.send(JSON.stringify({
         APIKey: API_KEY,
-        BoundingBoxes: [[[-90, -180], [90, 180]]],
-        FiltersShipMMSI: targets,
+        // 涵蓋香港全境、南丫島以南、蒲台島、澳門及珠江口
+        BoundingBoxes: [[[21.5, 113.0], [23.0, 115.2]]],
         FilterMessageTypes: [
           'PositionReport',
           'StandardClassBPositionReport',
@@ -99,8 +107,13 @@ async function main() {
         const type = msg.MessageType;
         const body = (msg.Message && msg.Message[type]) ? msg.Message[type] : {};
         const mmsi = String(meta.MMSI || body.UserID || '').trim();
+        if (!mmsi) return;
 
-        if (!mmsi || !targets.includes(mmsi) || recorded.has(mmsi)) return;
+        if (!targets.includes(mmsi)) {
+          seenOtherShips.add(mmsi);
+          return;
+        }
+        if (recorded.has(mmsi)) return;
 
         const lat = Number(body.Latitude ?? meta.latitude);
         const lng = Number(body.Longitude ?? meta.longitude);
@@ -129,7 +142,7 @@ async function main() {
         pendingPosts.push(p);
 
         if (recorded.size >= targets.length) {
-          finish('已收齊所有目標船隻最新座標');
+          finish(`已收齊所有目標船隻最新座標（期間香港周邊收到 ${seenOtherShips.size} 隻其他船）`);
         }
       } catch (err) {
         console.warn('⚠️ 解析訊號略過：', err.message);
@@ -141,8 +154,8 @@ async function main() {
       finish('連線中斷');
     });
 
-    ws.addEventListener('close', () => {
-      finish('連線已關閉');
+    ws.addEventListener('close', (ev) => {
+      finish(`連線已關閉 (code: ${ev.code}${ev.reason ? ', reason: ' + ev.reason : ''})`);
     });
   });
 
