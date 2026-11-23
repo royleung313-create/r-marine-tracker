@@ -2,12 +2,17 @@ name: R! Marine AIS Tracker
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: r-marine-ais-tracker
+  cancel-in-progress: false
 
 jobs:
   track:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
