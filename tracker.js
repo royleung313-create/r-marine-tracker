@@ -1,169 +1,241 @@
 // ==========================================
-// R! Marine - AISstream 實時座標接收器 (tracker.js)
-// 自動讀取 Google Sheets 船隻名單並寫回 24h 軌跡
+// R! Marine - GitHub Actions AIS 實時爬蟲 (tracker.js v2)
+// 使用 Node.js 22 內建 WebSocket 與 fetch（零外部套件）
+// 新增：自動同步追蹤名單、香港海域收船統計、爬蟲心跳回報至 Code.gs v7
 // ==========================================
 
 const API_KEY = (process.env.AISSTREAM_API_KEY || '').trim();
 const GAS_URL = (process.env.GAS_URL || '').trim();
-const LISTEN_TIMEOUT_MS = 210 * 1000; // 最多監聽 3.5 分鐘
+const DEFAULT_MMSI = '477995357'; // PACIFIC TRUST 保底目標
 
-if (!API_KEY || !GAS_URL) {
-  console.error('❌ 缺少 AISSTREAM_API_KEY 或 GAS_URL 環境變數');
-  process.exit(1);
-}
+// 監聽香港及珠江口海域範圍（用來同時統計周邊收船數，驗證 AISstream 連線健康）
+const HK_BOUNDING_BOX = [[[21.6, 113.3], [22.8, 114.8]]];
+const LISTEN_SECONDS = 210; // 最長收聽 3 分半鐘
+const MIN_EARLY_EXIT_SECONDS = 25; // 若全部目標船都捉齊，至少聽夠 25 秒再提早收工
 
-if (!GAS_URL.startsWith('https://')) {
-  console.error('❌ GAS_URL 格式唔正確（必須以 https:// 開頭），請檢查有冇同 AISSTREAM_API_KEY 掉轉貼錯！');
-  process.exit(1);
-}
-
-async function getTargetMmsis() {
-  const res = await fetch(`${GAS_URL}?t=${Date.now()}`, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  const list = (data.vessels || [])
-    .map(v => String(v.mmsi || '').replace(/\D/g, '').trim())
-    .filter(Boolean);
-  if (list.length > 0) {
-    return [...new Set(list)];
+async function fetchTargetMmsis() {
+  const targets = new Set([DEFAULT_MMSI]);
+  try {
+    const sep = GAS_URL.includes('?') ? '&' : '?';
+    const res = await fetch(`${GAS_URL}${sep}t=${Date.now()}`, {
+      method: 'GET',
+      redirect: 'follow'
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && Array.isArray(data.vessels)) {
+        for (const v of data.vessels) {
+          const mmsi = String(v.mmsi || '').replace(/\D/g, '').trim();
+          if (mmsi) targets.add(mmsi);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('讀取後台追蹤池失敗，先以預設船隻運行：', err.message);
   }
-  return ['477995357'];
+  return targets;
 }
 
-async function postTrackPoint(payload) {
+async function postToGas(payload) {
   const res = await fetch(GAS_URL, {
     method: 'POST',
+    redirect: 'follow',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    redirect: 'follow'
+    body: JSON.stringify(payload)
   });
   const text = await res.text();
-  console.log(`✅ 已寫入 ${payload.mmsi} (${payload.lat.toFixed(5)}, ${payload.lng.toFixed(5)} | ${payload.speed}kts) -> ${text}`);
+  if (!res.ok) {
+    throw new Error(`GAS HTTP ${res.status}: ${text.slice(0, 120)}`);
+  }
+  return text;
 }
 
-async function decodeMessage(data) {
-  if (typeof data === 'string') return data;
-  if (data instanceof Blob) return await data.text();
-  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
-  return String(data);
+async function decodeWsData(raw) {
+  if (typeof raw === 'string') return raw;
+  if (raw instanceof Blob) return await raw.text();
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString('utf8');
+  if (ArrayBuffer.isView(raw)) {
+    return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString('utf8');
+  }
+  return String(raw || '');
 }
 
-async function main() {
-  let targets = ['477995357'];
-  try {
-    targets = await getTargetMmsis();
-    console.log('✅ 成功從 Google Sheets 讀取最愛名單：', targets.join(', '));
-  } catch (err) {
-    console.warn('⚠️ 讀取 Google Sheets 名單失敗，改用預設 MMSI：', err.message);
+function extractVesselReport(msg) {
+  if (!msg || !msg.MetaData) return null;
+  const meta = msg.MetaData;
+  const mmsi = String(meta.MMSI || '').replace(/\D/g, '').trim();
+  if (!mmsi) return null;
+
+  const body =
+    (msg.Message && (
+      msg.Message.PositionReport ||
+      msg.Message.StandardClassBPositionReport ||
+      msg.Message.ExtendedClassBPositionReport
+    )) || null;
+
+  const lat = Number(body && body.Latitude !== undefined ? body.Latitude : meta.latitude);
+  const lng = Number(body && body.Longitude !== undefined ? body.Longitude : meta.longitude);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat === 0 || lng === 0) {
+    return null;
   }
 
-  const recorded = new Set();
-  const seenOtherShips = new Set();
-  const pendingPosts = [];
+  const rawSpeed = body && body.Sog !== undefined ? Number(body.Sog) : 0;
+  const rawCourse = body && body.Cog !== undefined ? Number(body.Cog) : 0;
 
-  await new Promise((resolve) => {
+  return {
+    mmsi,
+    lat: Math.round(lat * 100000) / 100000,
+    lng: Math.round(lng * 100000) / 100000,
+    speed: Number.isFinite(rawSpeed) && rawSpeed < 102 ? Math.round(rawSpeed * 10) / 10 : 0,
+    course: Number.isFinite(rawCourse) && rawCourse <= 360 ? Math.round(rawCourse) : 0,
+    timestamp: new Date().toISOString(),
+    source: 'AISstream'
+  };
+}
+
+function listenAisStream(targetSet) {
+  return new Promise((resolve) => {
+    const startMs = Date.now();
+    const heardMmsis = new Set();
+    const matchedMap = new Map();
+
     let finished = false;
-    const ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
+    let status = 'OK';
+    let note = '正常完成';
+    let ws = null;
+    let hardTimer = null;
 
-    const finish = (reason) => {
+    const finish = (finalStatus, finalNote) => {
       if (finished) return;
       finished = true;
-      clearTimeout(timer);
-      console.log('⏹️ 結束監聽：', reason);
-      try { ws.close(); } catch (e) {}
-      resolve();
+      if (finalStatus) status = finalStatus;
+      if (finalNote) note = finalNote;
+      if (hardTimer) clearTimeout(hardTimer);
+      try {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          ws.close();
+        }
+      } catch (e) {}
+      resolve({
+        status,
+        note,
+        heardCount: heardMmsis.size,
+        matchedList: Array.from(matchedMap.values()),
+        durationSec: Math.max(1, Math.round((Date.now() - startMs) / 1000))
+      });
     };
 
-    const timer = setTimeout(() => {
-      finish(`已達監聽上限（收到目標 ${recorded.size}/${targets.length} 隻船；期間香港周邊共收到 ${seenOtherShips.size} 隻其他船訊號）`);
-    }, LISTEN_TIMEOUT_MS);
+    hardTimer = setTimeout(() => {
+      finish('OK', matchedMap.size > 0 ? '定時收聽完成' : '正常收聽完成（目標船暫無廣播）');
+    }, LISTEN_SECONDS * 1000);
+
+    try {
+      ws = new WebSocket('wss://stream.aisstream.io/v0/stream');
+    } catch (err) {
+      finish('ERROR', '建立連線失敗：' + err.message);
+      return;
+    }
 
     ws.addEventListener('open', () => {
-      console.log('📡 已連線 AISstream，開始監聽香港及周邊水域訊號...');
-      ws.send(JSON.stringify({
+      console.log('已連線至 AISstream，開始監聽香港水域...');
+      const subMsg = {
         APIKey: API_KEY,
-        // 涵蓋香港全境、南丫島以南、蒲台島、澳門及珠江口
-        BoundingBoxes: [[[21.5, 113.0], [23.0, 115.2]]],
+        BoundingBoxes: HK_BOUNDING_BOX,
         FilterMessageTypes: [
           'PositionReport',
           'StandardClassBPositionReport',
           'ExtendedClassBPositionReport'
         ]
-      }));
+      };
+      ws.send(JSON.stringify(subMsg));
     });
 
     ws.addEventListener('message', async (event) => {
       try {
-        const raw = await decodeMessage(event.data);
-        const msg = JSON.parse(raw);
-
+        const text = await decodeWsData(event.data);
+        const msg = JSON.parse(text);
         if (msg.error) {
-          console.error('❌ AISstream 回傳錯誤：', msg.error);
-          finish('AISstream API 錯誤');
+          finish('ERROR', 'AISstream 錯誤：' + String(msg.error));
           return;
         }
 
-        const meta = msg.MetaData || {};
-        const type = msg.MessageType;
-        const body = (msg.Message && msg.Message[type]) ? msg.Message[type] : {};
-        const mmsi = String(meta.MMSI || body.UserID || '').trim();
-        if (!mmsi) return;
+        const report = extractVesselReport(msg);
+        if (!report) return;
 
-        if (!targets.includes(mmsi)) {
-          seenOtherShips.add(mmsi);
-          return;
+        heardMmsis.add(report.mmsi);
+
+        if (targetSet.has(report.mmsi)) {
+          matchedMap.set(report.mmsi, report);
+          console.log(`🎯 命中目標船 ${report.mmsi}：(${report.lat}, ${report.lng}) ${report.speed} kts`);
+
+          const elapsedSec = (Date.now() - startMs) / 1000;
+          if (matchedMap.size >= targetSet.size && elapsedSec >= MIN_EARLY_EXIT_SECONDS) {
+            finish('OK', '已捕捉全部目標船，提早完成');
+          }
         }
-        if (recorded.has(mmsi)) return;
-
-        const lat = Number(body.Latitude ?? meta.latitude);
-        const lng = Number(body.Longitude ?? meta.longitude);
-        if (isNaN(lat) || isNaN(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180 || (lat === 0 && lng === 0)) {
-          return;
-        }
-
-        const speed = Number(body.Sog ?? 0);
-        let course = Number(body.Cog ?? 0);
-        if (isNaN(course) || course >= 360) {
-          const hdg = Number(body.TrueHeading ?? 0);
-          course = (!isNaN(hdg) && hdg < 360) ? hdg : 0;
-        }
-
-        recorded.add(mmsi);
-        const p = postTrackPoint({
-          mmsi,
-          lat,
-          lng,
-          speed: isNaN(speed) ? 0 : Math.round(speed * 10) / 10,
-          course: Math.round(course),
-          timestamp: new Date().toISOString(),
-          source: 'AIS'
-        }).catch(err => console.error(`❌ 寫入 ${mmsi} 失敗：`, err.message));
-
-        pendingPosts.push(p);
-
-        if (recorded.size >= targets.length) {
-          finish(`已收齊所有目標船隻最新座標（期間香港周邊收到 ${seenOtherShips.size} 隻其他船）`);
-        }
-      } catch (err) {
-        console.warn('⚠️ 解析訊號略過：', err.message);
+      } catch (e) {
+        // 忽略個別格式異常封包
       }
     });
 
-    ws.addEventListener('error', (err) => {
-      console.error('⚠️ WebSocket 連線異常：', err.message || err);
-      finish('連線中斷');
+    ws.addEventListener('error', () => {
+      finish('ERROR', 'AISstream 連線異常中斷');
     });
 
     ws.addEventListener('close', (ev) => {
-      finish(`連線已關閉 (code: ${ev.code}${ev.reason ? ', reason: ' + ev.reason : ''})`);
+      if (!finished) {
+        const reason = ev && ev.code ? `連線提前關閉 (code ${ev.code})` : '連線提前關閉';
+        finish(heardMmsis.size > 0 ? 'OK' : 'WARN', reason);
+      }
     });
   });
-
-  await Promise.allSettled(pendingPosts);
-  console.log(`🏁 本輪任務完成，共寫入 ${recorded.size} 筆實時座標。`);
 }
 
-main().catch(err => {
-  console.error('❌ 執行失敗：', err);
+async function main() {
+  if (!API_KEY || !GAS_URL) {
+    console.error('❌ 缺少環境變數：請確認 GitHub Secrets 已設定 AISSTREAM_API_KEY 同 GAS_URL');
+    process.exit(1);
+  }
+
+  console.log('1. 正在向 Google 後台讀取最新追蹤船隻名單...');
+  const targetSet = await fetchTargetMmsis();
+  console.log(`📋 本輪追蹤目標 (${targetSet.size} 隻)：${Array.from(targetSet).join(', ')}`);
+
+  console.log(`2. 開始收聽香港水域 AIS 船訊（最長 ${LISTEN_SECONDS} 秒）...`);
+  const result = await listenAisStream(targetSet);
+  console.log(`📡 收聽結束：香港周邊共收到 ${result.heardCount} 隻船，命中目標 ${result.matchedList.length}/${targetSet.size} 隻（耗時 ${result.durationSec} 秒）`);
+
+  // 寫入有命中嘅目標船座標
+  let uploadedCount = 0;
+  for (const pt of result.matchedList) {
+    try {
+      await postToGas(pt);
+      uploadedCount++;
+      console.log(`✅ 已寫入座標：MMSI ${pt.mmsi}`);
+    } catch (err) {
+      console.error(`⚠️ 寫入座標失敗 (${pt.mmsi})：`, err.message);
+    }
+  }
+
+  // 無論有冇命中目標船，都發送爬蟲心跳俾 Code.gs 記錄，供站長暗門顯示
+  try {
+    await postToGas({
+      action: 'heartbeat',
+      status: result.status,
+      totalHeard: result.heardCount,
+      matchedCount: uploadedCount,
+      targetCount: targetSet.size,
+      durationSec: result.durationSec,
+      note: result.note
+    });
+    console.log('💓 爬蟲心跳已成功回報至 Google 後台');
+  } catch (err) {
+    console.error('⚠️ 心跳回報失敗：', err.message);
+  }
+}
+
+main().catch((err) => {
+  console.error('程式執行錯誤：', err);
   process.exit(1);
 });
